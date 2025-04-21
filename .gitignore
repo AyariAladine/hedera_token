@@ -1,0 +1,8 @@
+# Ignore everything
+*
+
+# But NOT these files
+!.gitignore
+!create-token.js
+!package.json
+!package-lock.json
