@@ -556,29 +556,21 @@ app.post('/api/tokens/sell', async (req, res) => {
         error: 'Either seller or buyer private key is required for token association'
       });
     }
-    
-    if (tokenOwnership[tokenId] && 
-        tokenOwnership[tokenId].ownerAccountId !== sellerAccountId) {
-      return res.status(403).json({ 
-        error: 'Unauthorized: Only the token owner can sell stock' 
-      });
-    }
-    
+
     const { client, operatorPrivateKey } = getClient();
-    
+
     const tokenInfo = await new TokenInfoQuery()
       .setTokenId(tokenId)
       .execute(client);
-      
     const decimals = tokenInfo.decimals;
     const amount = amountKg * (10 ** decimals);
-    
+
     const sellerAccount = AccountId.fromString(sellerAccountId);
     const buyerAccount = AccountId.fromString(buyerAccountId);
-    
+
     let sellerKey = null;
     let buyerKey = null;
-    
+
     if (sellerPrivateKey) {
       try {
         sellerKey = PrivateKey.fromString(sellerPrivateKey);
@@ -589,7 +581,7 @@ app.post('/api/tokens/sell', async (req, res) => {
         });
       }
     }
-    
+
     if (buyerPrivateKey) {
       try {
         buyerKey = PrivateKey.fromString(buyerPrivateKey);
@@ -600,19 +592,22 @@ app.post('/api/tokens/sell', async (req, res) => {
         });
       }
     }
-    
+
+    // Check seller balance
     if (!tokenBalances[tokenId]) {
       tokenBalances[tokenId] = {};
+    }
+    if (!tokenBalances[tokenId][sellerAccountId] || tokenBalances[tokenId][sellerAccountId] < amountKg) {
+      return res.status(400).json({
+        error: 'Seller has insufficient balance'
+      });
     }
     if (!tokenBalances[tokenId][buyerAccountId]) {
       tokenBalances[tokenId][buyerAccountId] = 0;
     }
-    if (!tokenBalances[tokenId][sellerAccountId]) {
-      tokenBalances[tokenId][sellerAccountId] = 0;
-    }
-    
-     let needsAssociation = true;
-    
+
+    let needsAssociation = true;
+
     if (buyerKey) {
       try {
         const accountInfo = await new AccountBalanceQuery()
@@ -620,31 +615,22 @@ app.post('/api/tokens/sell', async (req, res) => {
           .execute(client);
         
         if (accountInfo.tokens && accountInfo.tokens._map.has(tokenId)) {
-          console.log(`Token ${tokenId} is already associated with buyer account ${buyerAccountId}`);
           needsAssociation = false;
         }
       } catch (error) {
         console.warn(`Could not check if token ${tokenId} is associated with account ${buyerAccountId}: ${error.message}`);
       }
-      
       if (needsAssociation) {
         try {
-          console.log(`Attempting to associate token ${tokenId} with buyer account ${buyerAccountId}`);
-          
           const associateTx = await new TokenAssociateTransaction()
             .setAccountId(buyerAccount)
             .setTokenIds([tokenId])
             .freezeWith(client)
             .sign(buyerKey);
-            
           const associateSubmit = await associateTx.execute(client);
           await associateSubmit.getReceipt(client);
-          
-          console.log(`Successfully associated token ${tokenId} with buyer account ${buyerAccountId}`);
         } catch (associateError) {
-          if (associateError.toString().includes('TOKEN_ALREADY_ASSOCIATED_WITH_ACCOUNT')) {
-            console.log(`Token ${tokenId} was already associated with buyer account ${buyerAccountId}`);
-          } else {
+          if (!associateError.toString().includes('TOKEN_ALREADY_ASSOCIATED_WITH_ACCOUNT')) {
             throw associateError;
           }
         }
@@ -656,28 +642,24 @@ app.post('/api/tokens/sell', async (req, res) => {
       .addTokenTransfer(tokenId, buyerAccount, amount);  
     
     let frozenTx = await transferTx.freezeWith(client);
-    
     if (sellerKey) {
       frozenTx = await frozenTx.sign(sellerKey);
     }
-    
     if (buyerKey) {
       frozenTx = await frozenTx.sign(buyerKey);
     }
-    
     if (!sellerKey && !buyerKey) {
       frozenTx = await frozenTx.sign(operatorPrivateKey);
-      console.warn("Using operator key for token transfer. In production, this should be signed by the seller or buyer.");
     }
-    
     const txSubmit = await frozenTx.execute(client);
     const receipt = await txSubmit.getReceipt(client);
-    
+
     tokenBalances[tokenId][sellerAccountId] -= amountKg;
     tokenBalances[tokenId][buyerAccountId] += amountKg;
-    
+
+    // Optionally, update tokenOwnership if all tokens transferred
     const totalSupply = tokenInfo.totalSupply.toNumber() / (10 ** decimals);
-    if (amountKg === totalSupply) {
+    if (tokenBalances[tokenId][sellerAccountId] === 0 && tokenBalances[tokenId][buyerAccountId] === totalSupply) {
       tokenOwnership[tokenId] = {
         ...tokenOwnership[tokenId],
         ownerAccountId: buyerAccountId,
@@ -696,7 +678,6 @@ app.post('/api/tokens/sell', async (req, res) => {
       transactionId: txSubmit.transactionId.toString(),
       message: `Successfully transferred ${amountKg} kg to account ${buyerAccountId}`
     });
-    
   } catch (error) {
     console.error("Error selling stock:", error);
     res.status(500).json({
