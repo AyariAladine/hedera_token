@@ -550,7 +550,6 @@ app.post('/api/tokens/sell', async (req, res) => {
         error: 'Token ID, seller account ID, buyer account ID, and positive amount in kg are required' 
       });
     }
-    
     if (!sellerPrivateKey && !buyerPrivateKey) {
       return res.status(400).json({
         error: 'Either seller or buyer private key is required for token association'
@@ -559,6 +558,7 @@ app.post('/api/tokens/sell', async (req, res) => {
 
     const { client, operatorPrivateKey } = getClient();
 
+    // Get decimals info
     const tokenInfo = await new TokenInfoQuery()
       .setTokenId(tokenId)
       .execute(client);
@@ -581,7 +581,6 @@ app.post('/api/tokens/sell', async (req, res) => {
         });
       }
     }
-
     if (buyerPrivateKey) {
       try {
         buyerKey = PrivateKey.fromString(buyerPrivateKey);
@@ -593,27 +592,45 @@ app.post('/api/tokens/sell', async (req, res) => {
       }
     }
 
-    // Check seller balance
-    if (!tokenBalances[tokenId]) {
-      tokenBalances[tokenId] = {};
-    }
-    if (!tokenBalances[tokenId][sellerAccountId] || tokenBalances[tokenId][sellerAccountId] < amountKg) {
+    // Always check LIVE seller balance from Hedera!
+    const sellerBalanceQuery = await new AccountBalanceQuery()
+      .setAccountId(sellerAccountId)
+      .execute(client);
+    const tokenBalanceTinyUnits = sellerBalanceQuery.tokens._map.get(tokenId);
+    const sellerLiveBalanceKg = tokenBalanceTinyUnits
+      ? tokenBalanceTinyUnits.toNumber() / (10 ** decimals)
+      : 0;
+    if (sellerLiveBalanceKg < amountKg) {
       return res.status(400).json({
-        error: 'Seller has insufficient balance'
+        error: 'Seller has insufficient balance',
+        sellerLiveBalanceKg
       });
     }
+
+    // Optionally, update the in-memory cache for seller
+    if (!tokenBalances[tokenId]) tokenBalances[tokenId] = {};
+    tokenBalances[tokenId][sellerAccountId] = sellerLiveBalanceKg;
+
+    // Ensure buyer has an entry in our cache (optional, but safe)
     if (!tokenBalances[tokenId][buyerAccountId]) {
-      tokenBalances[tokenId][buyerAccountId] = 0;
+      // Also fetch live buyer balance for accuracy
+      const buyerBalanceQuery = await new AccountBalanceQuery()
+        .setAccountId(buyerAccountId)
+        .execute(client);
+      const buyerTokenBalanceTinyUnits = buyerBalanceQuery.tokens._map.get(tokenId);
+      const buyerLiveBalanceKg = buyerTokenBalanceTinyUnits
+        ? buyerTokenBalanceTinyUnits.toNumber() / (10 ** decimals)
+        : 0;
+      tokenBalances[tokenId][buyerAccountId] = buyerLiveBalanceKg;
     }
 
+    // Ensure buyer is associated with the token
     let needsAssociation = true;
-
     if (buyerKey) {
       try {
         const accountInfo = await new AccountBalanceQuery()
           .setAccountId(buyerAccount)
           .execute(client);
-        
         if (accountInfo.tokens && accountInfo.tokens._map.has(tokenId)) {
           needsAssociation = false;
         }
@@ -637,10 +654,11 @@ app.post('/api/tokens/sell', async (req, res) => {
       }
     }
 
+    // Build and sign transfer transaction
     let transferTx = new TransferTransaction()
-      .addTokenTransfer(tokenId, sellerAccount, -amount) 
-      .addTokenTransfer(tokenId, buyerAccount, amount);  
-    
+      .addTokenTransfer(tokenId, sellerAccount, -amount)
+      .addTokenTransfer(tokenId, buyerAccount, amount);
+
     let frozenTx = await transferTx.freezeWith(client);
     if (sellerKey) {
       frozenTx = await frozenTx.sign(sellerKey);
@@ -652,8 +670,9 @@ app.post('/api/tokens/sell', async (req, res) => {
       frozenTx = await frozenTx.sign(operatorPrivateKey);
     }
     const txSubmit = await frozenTx.execute(client);
-    const receipt = await txSubmit.getReceipt(client);
+    await txSubmit.getReceipt(client);
 
+    // Update in-memory balances for UI (optional)
     tokenBalances[tokenId][sellerAccountId] -= amountKg;
     tokenBalances[tokenId][buyerAccountId] += amountKg;
 
